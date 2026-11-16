@@ -1,0 +1,289 @@
+//@version=6
+// Volume Spikes • Gaps • Equal Highs/Lows (liquidity)
+// - Volume spikes: volume vs. its moving average (prior bars only, so a spike can't inflate its own baseline)
+// - Gaps: Fair Value Gaps (3-candle imbalance) and/or opening gaps. A gap is "verified" (✔) when it was
+//   created on a volume spike. Gaps extend right until filled; partial fills shrink the box.
+// - Equal highs/lows: swing pivots that match an earlier unbroken swing within an ATR tolerance.
+//   These are resting liquidity pools. Lines extend until price sweeps them; a sweep that closes back
+//   inside is marked as a liquidity grab.
+indicator("Volume Spikes, Gaps & Equal Highs/Lows", shorttitle = "VSG-EQ", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpV = "Volume Spikes"
+showVol     = input.bool(true, "Show volume spikes", group = grpV)
+volLen      = input.int(20, "Average length", minval = 1, group = grpV)
+volMult     = input.float(2.0, "Spike threshold (x average)", minval = 1.0, step = 0.1, group = grpV)
+volExtMult  = input.float(3.5, "Extreme threshold (x average)", minval = 1.0, step = 0.1, group = grpV)
+colorBars   = input.bool(true, "Color spike candles", group = grpV)
+volUpCol    = input.color(#00e676, "Bullish spike", group = grpV, inline = "vc")
+volDnCol    = input.color(#ff5252, "Bearish spike", group = grpV, inline = "vc")
+
+grpG = "Gaps"
+showGaps     = input.bool(true, "Show gaps", group = grpG)
+gapMode      = input.string("Both", "Gap type", options = ["Fair Value Gaps", "Opening Gaps", "Both"], group = grpG)
+gapMinAtr    = input.float(0.1, "Minimum size (x ATR)", minval = 0.0, step = 0.05, group = grpG)
+requireVol   = input.bool(false, "Only show gaps verified by a volume spike", group = grpG)
+shrinkGaps   = input.bool(true, "Shrink on partial fill", group = grpG)
+deleteFilled = input.bool(false, "Remove gaps once filled", group = grpG)
+maxGaps      = input.int(40, "Max tracked gaps", minval = 1, maxval = 250, group = grpG)
+bullGapCol   = input.color(#26a69a, "Bullish gap", group = grpG, inline = "gc")
+bearGapCol   = input.color(#ef5350, "Bearish gap", group = grpG, inline = "gc")
+filledGapCol = input.color(color.new(#787b86, 90), "Filled gap", group = grpG)
+
+grpE = "Equal Highs / Lows"
+showEq      = input.bool(true, "Show equal highs / lows", group = grpE)
+pivLen      = input.int(5, "Swing length (bars each side)", minval = 1, group = grpE)
+eqTolAtr    = input.float(0.1, "Tolerance (x ATR)", minval = 0.0, step = 0.01, group = grpE)
+eqLookback  = input.int(300, "Max bars between swings", minval = 10, group = grpE)
+maxEq       = input.int(30, "Max tracked levels", minval = 1, maxval = 200, group = grpE)
+eqhCol      = input.color(#ff9800, "Equal highs (buy-side liquidity)", group = grpE)
+eqlCol      = input.color(#2962ff, "Equal lows (sell-side liquidity)", group = grpE)
+sweptCol    = input.color(color.new(#787b86, 40), "Swept level", group = grpE)
+
+grpD = "Display"
+showDash = input.bool(true, "Show dashboard", group = grpD)
+atrLen   = input.int(14, "ATR length", minval = 1, group = grpD)
+
+// ───────────────────────────── Types ─────────────────────────────
+type Gap
+    box   bx
+    float top
+    float bottom
+    bool  bull
+    bool  verified
+    string kind
+
+type Pivot
+    float price
+    int   idx
+    float tol
+
+type EqLevel
+    line  ln
+    label lb
+    float level
+    bool  isHigh
+
+// ───────────────────────────── Core series ─────────────────────────────
+atr = ta.atr(atrLen)
+
+vol       = nz(volume)
+volAvg    = ta.sma(vol, volLen)[1]
+volRatio  = nz(volAvg) > 0 ? vol / volAvg : 0.0
+isSpike   = volRatio >= volMult
+isExtreme = volRatio >= volExtMult
+bullBar   = close >= open
+
+// ───────────────────────────── Volume spike visuals ─────────────────────────────
+plotshape(showVol and isSpike and not isExtreme and bullBar, title = "Bullish volume spike",
+     style = shape.triangleup, location = location.belowbar, color = volUpCol, size = size.tiny)
+plotshape(showVol and isSpike and not isExtreme and not bullBar, title = "Bearish volume spike",
+     style = shape.triangledown, location = location.abovebar, color = volDnCol, size = size.tiny)
+plotshape(showVol and isExtreme and bullBar, title = "Extreme bullish volume",
+     style = shape.triangleup, location = location.belowbar, color = volUpCol, size = size.small, text = "XV", textcolor = volUpCol)
+plotshape(showVol and isExtreme and not bullBar, title = "Extreme bearish volume",
+     style = shape.triangledown, location = location.abovebar, color = volDnCol, size = size.small, text = "XV", textcolor = volDnCol)
+barcolor(showVol and colorBars and isSpike ? (bullBar ? volUpCol : volDnCol) : na, title = "Spike candle color")
+
+// ───────────────────────────── Gaps ─────────────────────────────
+var array<Gap> gaps = array.new<Gap>()
+
+bool newBullGap     = false
+bool newBearGap     = false
+bool newVerifiedGap = false
+bool gapFilled      = false
+
+// 1) Update existing gaps (before adding new ones so a fresh gap isn't tested on its own bar)
+if gaps.size() > 0
+    for i = gaps.size() - 1 to 0
+        g = gaps.get(i)
+        filled = g.bull ? low <= g.bottom : high >= g.top
+        if filled
+            gapFilled := true
+            if deleteFilled
+                g.bx.delete()
+            else
+                g.bx.set_right(bar_index)
+                g.bx.set_bgcolor(filledGapCol)
+                g.bx.set_border_color(filledGapCol)
+                g.bx.set_text("")
+            gaps.remove(i)
+        else
+            if shrinkGaps
+                if g.bull and low < g.top
+                    g.top := low
+                    g.bx.set_top(low)
+                if not g.bull and high > g.bottom
+                    g.bottom := high
+                    g.bx.set_bottom(high)
+            g.bx.set_right(bar_index + 3)
+
+addGap(array<Gap> arr, float top, float bottom, int left, bool isBull, bool verified, string kind, int maxN) =>
+    base = isBull ? bullGapCol : bearGapCol
+    fillCol = color.new(base, verified ? 65 : 85)
+    edge = color.new(base, verified ? 0 : 70)
+    txt  = (isBull ? "Bull " : "Bear ") + kind + (verified ? " ✔" : "")
+    bx = box.new(left, top, bar_index + 3, bottom, border_color = edge, bgcolor = fillCol,
+         border_width = verified ? 2 : 1, text = txt, text_size = size.tiny,
+         text_color = color.new(base, 0), text_halign = text.align_right, text_valign = text.align_center)
+    arr.push(Gap.new(bx, top, bottom, isBull, verified, kind))
+    if arr.size() > maxN
+        old = arr.shift()
+        old.bx.set_right(bar_index)
+    true
+
+minGapSize = atr * gapMinAtr
+useFvg = gapMode != "Opening Gaps"
+useOg  = gapMode != "Fair Value Gaps"
+
+if showGaps and bar_index > 2
+    // Fair Value Gaps: candle 1 and candle 3 wicks don't overlap; candle 2 is the displacement candle
+    if useFvg
+        fvgVerified = isSpike[1] or isSpike
+        if low > high[2] and (low - high[2]) >= minGapSize and (fvgVerified or not requireVol)
+            addGap(gaps, low, high[2], bar_index - 1, true, fvgVerified, "FVG", maxGaps)
+            newBullGap := true
+            newVerifiedGap := newVerifiedGap or fvgVerified
+        if high < low[2] and (low[2] - high) >= minGapSize and (fvgVerified or not requireVol)
+            addGap(gaps, low[2], high, bar_index - 1, false, fvgVerified, "FVG", maxGaps)
+            newBearGap := true
+            newVerifiedGap := newVerifiedGap or fvgVerified
+    // Opening gaps: the whole bar sits beyond the previous bar's range
+    if useOg
+        if low > high[1] and (low - high[1]) >= minGapSize and (isSpike or not requireVol)
+            addGap(gaps, low, high[1], bar_index - 1, true, isSpike, "Gap", maxGaps)
+            newBullGap := true
+            newVerifiedGap := newVerifiedGap or isSpike
+        if high < low[1] and (low[1] - high) >= minGapSize and (isSpike or not requireVol)
+            addGap(gaps, low[1], high, bar_index - 1, false, isSpike, "Gap", maxGaps)
+            newBearGap := true
+            newVerifiedGap := newVerifiedGap or isSpike
+
+// ───────────────────────────── Equal highs / lows ─────────────────────────────
+var array<Pivot>   pHighs = array.new<Pivot>()
+var array<Pivot>   pLows  = array.new<Pivot>()
+var array<EqLevel> eqs    = array.new<EqLevel>()
+
+bool newEQH   = false
+bool newEQL   = false
+bool eqhSwept = false
+bool eqlSwept = false
+
+// 1) Drop swing candidates that price has broken through or that are too old
+if pHighs.size() > 0
+    for i = pHighs.size() - 1 to 0
+        p = pHighs.get(i)
+        if high > p.price + p.tol or bar_index - p.idx > eqLookback
+            pHighs.remove(i)
+if pLows.size() > 0
+    for i = pLows.size() - 1 to 0
+        p = pLows.get(i)
+        if low < p.price - p.tol or bar_index - p.idx > eqLookback
+            pLows.remove(i)
+
+// 2) Extend active equal levels and detect sweeps
+if eqs.size() > 0
+    for i = eqs.size() - 1 to 0
+        e = eqs.get(i)
+        swept = e.isHigh ? high > e.level : low < e.level
+        if swept
+            grab = e.isHigh ? close < e.level : close > e.level
+            e.ln.set_x2(bar_index)
+            e.ln.set_color(sweptCol)
+            e.ln.set_style(line.style_dotted)
+            tag = e.isHigh ? "EQH" : "EQL"
+            e.lb.set_text(tag + (grab ? " grab" : " swept") + (isSpike ? " ⚡" : ""))
+            e.lb.set_textcolor(sweptCol)
+            if e.isHigh
+                eqhSwept := true
+            else
+                eqlSwept := true
+            eqs.remove(i)
+        else
+            e.ln.set_x2(bar_index)
+
+// 3) New swing points
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+tol = atr * eqTolAtr
+pivBar = bar_index - pivLen
+
+addEq(array<EqLevel> arr, int x1, int x2, float lvl, bool isHigh, int maxN) =>
+    col = isHigh ? eqhCol : eqlCol
+    ln = line.new(x1, lvl, bar_index, lvl, color = col, style = line.style_dashed, width = 2)
+    lb = label.new(x2, lvl, isHigh ? "EQH" : "EQL", color = color.new(color.black, 100),
+         style = isHigh ? label.style_label_down : label.style_label_up, textcolor = col, size = size.small)
+    arr.push(EqLevel.new(ln, lb, lvl, isHigh))
+    if arr.size() > maxN
+        old = arr.shift()
+        old.ln.set_x2(bar_index)
+    true
+
+if not na(ph)
+    if showEq and pHighs.size() > 0
+        for i = pHighs.size() - 1 to 0
+            p = pHighs.get(i)
+            if math.abs(ph - p.price) <= tol
+                addEq(eqs, p.idx, pivBar, math.max(ph, p.price), true, maxEq)
+                newEQH := true
+                pHighs.remove(i)
+                break
+    pHighs.push(Pivot.new(ph, pivBar, tol))
+    if pHighs.size() > 20
+        pHighs.shift()
+
+if not na(pl)
+    if showEq and pLows.size() > 0
+        for i = pLows.size() - 1 to 0
+            p = pLows.get(i)
+            if math.abs(pl - p.price) <= tol
+                addEq(eqs, p.idx, pivBar, math.min(pl, p.price), false, maxEq)
+                newEQL := true
+                pLows.remove(i)
+                break
+    pLows.push(Pivot.new(pl, pivBar, tol))
+    if pLows.size() > 20
+        pLows.shift()
+
+// ───────────────────────────── Dashboard ─────────────────────────────
+var table dash = table.new(position.top_right, 2, 4, bgcolor = color.new(#131722, 15),
+     border_color = color.new(#787b86, 60), border_width = 1)
+
+if showDash and barstate.islast
+    nBull = 0
+    nBear = 0
+    for g in gaps
+        if g.bull
+            nBull += 1
+        else
+            nBear += 1
+    nEqh = 0
+    nEql = 0
+    for e in eqs
+        if e.isHigh
+            nEqh += 1
+        else
+            nEql += 1
+    txtCol = color.new(#d1d4dc, 0)
+    volCol = isSpike ? (bullBar ? volUpCol : volDnCol) : txtCol
+    dash.cell(0, 0, "Volume", text_color = txtCol, text_size = size.small, text_halign = text.align_left)
+    dash.cell(1, 0, str.tostring(volRatio, "#.##") + "x avg", text_color = volCol, text_size = size.small)
+    dash.cell(0, 1, "Open gaps (bull/bear)", text_color = txtCol, text_size = size.small, text_halign = text.align_left)
+    dash.cell(1, 1, str.tostring(nBull) + " / " + str.tostring(nBear), text_color = txtCol, text_size = size.small)
+    dash.cell(0, 2, "Resting EQH", text_color = txtCol, text_size = size.small, text_halign = text.align_left)
+    dash.cell(1, 2, str.tostring(nEqh), text_color = eqhCol, text_size = size.small)
+    dash.cell(0, 3, "Resting EQL", text_color = txtCol, text_size = size.small, text_halign = text.align_left)
+    dash.cell(1, 3, str.tostring(nEql), text_color = eqlCol, text_size = size.small)
+
+// ───────────────────────────── Alerts ─────────────────────────────
+alertcondition(isSpike, "Volume spike", "Volume spike on {{ticker}} ({{interval}})")
+alertcondition(isExtreme, "Extreme volume spike", "Extreme volume on {{ticker}} ({{interval}})")
+alertcondition(newBullGap, "New bullish gap", "Bullish gap formed on {{ticker}} ({{interval}})")
+alertcondition(newBearGap, "New bearish gap", "Bearish gap formed on {{ticker}} ({{interval}})")
+alertcondition(newVerifiedGap, "Volume-verified gap", "Gap with volume spike on {{ticker}} ({{interval}})")
+alertcondition(gapFilled, "Gap filled", "A gap was filled on {{ticker}} ({{interval}})")
+alertcondition(newEQH, "Equal highs formed", "Equal highs (buy-side liquidity) on {{ticker}} ({{interval}})")
+alertcondition(newEQL, "Equal lows formed", "Equal lows (sell-side liquidity) on {{ticker}} ({{interval}})")
+alertcondition(eqhSwept, "Equal highs swept", "Equal highs swept on {{ticker}} ({{interval}})")
+alertcondition(eqlSwept, "Equal lows swept", "Equal lows swept on {{ticker}} ({{interval}})")
